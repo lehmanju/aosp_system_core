@@ -22,7 +22,10 @@
 #include <fcntl.h>
 #include <errno.h>
 
-#include "mincrypt/sha.h"
+#include <openssl/sha.h>
+#define SHA_INIT    SHA1_Init
+#define SHA_UPDATE  SHA1_Update
+
 #include "bootimg.h"
 
 static void *load_file(const char *fn, unsigned *_sz)
@@ -65,6 +68,9 @@ int usage(void)
             "       [ --board <boardname> ]\n"
             "       [ --base <address> ]\n"
             "       [ --pagesize <pagesize> ]\n"
+            "       [ --ramdiskaddr <address> ]\n"
+            "       [ --secondaddr <address> ]\n"
+            "       [ --tagsaddr <address>  ]\n"
             "       -o|--output <filename>\n"
             );
     return 1;
@@ -108,17 +114,19 @@ int main(int argc, char **argv)
     unsigned pagesize = 2048;
     int fd;
     SHA_CTX ctx;
-    uint8_t* sha;
-    unsigned base           = 0x10000000;
-    unsigned kernel_offset  = 0x00008000;
-    unsigned ramdisk_offset = 0x01000000;
-    unsigned second_offset  = 0x00f00000;
-    unsigned tags_offset    = 0x00000100;
+    unsigned char sha[SHA_DIGEST_LENGTH];
 
     argc--;
     argv++;
 
     memset(&hdr, 0, sizeof(hdr));
+
+        /* default load addresses */
+    hdr.kernel_addr =  0x60408000;
+    hdr.ramdisk_addr = 0x62000000;
+    hdr.second_addr =  0x60f00000;
+    hdr.tags_addr =    0x60088000;
+    hdr.second_size = 0;
 
     while(argc > 0){
         char *arg = argv[0];
@@ -139,21 +147,22 @@ int main(int argc, char **argv)
         } else if(!strcmp(arg, "--cmdline")) {
             cmdline = val;
         } else if(!strcmp(arg, "--base")) {
-            base = strtoul(val, 0, 16);
-        } else if(!strcmp(arg, "--kernel_offset")) {
-            kernel_offset = strtoul(val, 0, 16);
-        } else if(!strcmp(arg, "--ramdisk_offset")) {
-            ramdisk_offset = strtoul(val, 0, 16);
-        } else if(!strcmp(arg, "--second_offset")) {
-            second_offset = strtoul(val, 0, 16);
-        } else if(!strcmp(arg, "--tags_offset")) {
-            tags_offset = strtoul(val, 0, 16);
+            unsigned base = strtoul(val, 0, 16);
+            hdr.kernel_addr =  base + 0x00008000;
+            hdr.ramdisk_addr = base + 0x01000000;
+            hdr.second_addr =  base + 0x00F00000;
+            hdr.tags_addr =    base + 0x00000100;
+        } else if(!strcmp(arg, "--ramdiskaddr")) {
+            hdr.ramdisk_addr = strtoul(val, 0, 16);
+        } else if(!strcmp(arg, "--secondaddr")) {
+            hdr.second_addr = strtoul(val, 0, 16);
+        } else if(!strcmp(arg, "--tagsaddr")) {
+            hdr.tags_addr = strtoul(val, 0, 16);
         } else if(!strcmp(arg, "--board")) {
             board = val;
         } else if(!strcmp(arg,"--pagesize")) {
             pagesize = strtoul(val, 0, 10);
-            if ((pagesize != 2048) && (pagesize != 4096)
-                && (pagesize != 8192) && (pagesize != 16384)) {
+            if ((pagesize != 2048) && (pagesize != 4096) && (pagesize != 16384)) {
                 fprintf(stderr,"error: unsupported page size %d\n", pagesize);
                 return -1;
             }
@@ -163,10 +172,6 @@ int main(int argc, char **argv)
     }
     hdr.page_size = pagesize;
 
-    hdr.kernel_addr =  base + kernel_offset;
-    hdr.ramdisk_addr = base + ramdisk_offset;
-    hdr.second_addr =  base + second_offset;
-    hdr.tags_addr =    base + tags_offset;
 
     if(bootimg == 0) {
         fprintf(stderr,"error: no output filename specified\n");
@@ -226,16 +231,19 @@ int main(int argc, char **argv)
     /* put a hash of the contents in the header so boot images can be
      * differentiated based on their first 2k.
      */
-    SHA_init(&ctx);
-    SHA_update(&ctx, kernel_data, hdr.kernel_size);
-    SHA_update(&ctx, &hdr.kernel_size, sizeof(hdr.kernel_size));
-    SHA_update(&ctx, ramdisk_data, hdr.ramdisk_size);
-    SHA_update(&ctx, &hdr.ramdisk_size, sizeof(hdr.ramdisk_size));
-    SHA_update(&ctx, second_data, hdr.second_size);
-    SHA_update(&ctx, &hdr.second_size, sizeof(hdr.second_size));
-    sha = SHA_final(&ctx);
+    SHA_INIT(&ctx);
+    SHA_UPDATE(&ctx, kernel_data, hdr.kernel_size);
+    SHA_UPDATE(&ctx, &hdr.kernel_size, sizeof(hdr.kernel_size));
+    SHA_UPDATE(&ctx, ramdisk_data, hdr.ramdisk_size);
+    SHA_UPDATE(&ctx, &hdr.ramdisk_size, sizeof(hdr.ramdisk_size));
+    SHA_UPDATE(&ctx, second_data, hdr.second_size);
+    SHA_UPDATE(&ctx, &hdr.second_size, sizeof(hdr.second_size));
+    /* tags_addr, page_size, unused[2], name[], and cmdline[] */
+    SHA_UPDATE(&ctx, &hdr.tags_addr, 4 + 4 + 4 + 4 + 16 + 512);
+
+    SHA1_Final(sha, &ctx);
     memcpy(hdr.id, sha,
-           SHA_DIGEST_SIZE > sizeof(hdr.id) ? sizeof(hdr.id) : SHA_DIGEST_SIZE);
+        SHA_DIGEST_LENGTH > sizeof(hdr.id) ? sizeof(hdr.id) : SHA_DIGEST_LENGTH);
 
     fd = open(bootimg, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if(fd < 0) {
@@ -257,6 +265,7 @@ int main(int argc, char **argv)
         if(write_padding(fd, pagesize, hdr.ramdisk_size)) goto fail;
     }
 
+    close(fd);
     return 0;
 
 fail:
